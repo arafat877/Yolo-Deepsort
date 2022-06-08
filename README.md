@@ -13,10 +13,10 @@ git clone https://github.com/kadirnar/Yolo-DeepSort
 cd Yolo-DeepSort
 pip install -r requirements.txt
 ```
-### Yolov5 Model + DeepSort
+### Yolov5 + DeepSort
 ```
-python detect.py --source 0 --yolo_model yolov5m.pt --deep_sort_model osnet_x1_0 --show-vid
+python yolov5_deepsort.py --source 0 --yolo_model yolov5m.pt --deep_sort_model osnet_x1_0 --show-vid
 ```
-### Yolov5 Model + DeepSort
+### YOLOX + DeepSort
 
 It will be added soon.
