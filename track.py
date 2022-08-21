@@ -1,6 +1,11 @@
-import argparse
-
+from yolov5.utils.general import non_max_suppression, scale_coords, xyxy2xywh
+from yolov5.utils.plots import Annotator, colors
+from yolov5.utils.torch_utils import select_device
+from yolov5.utils.dataloaders import LoadImages
+import torch 
+import cv2
 import os
+
 # limit the number of cpus used by high performance libraries
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -8,255 +13,119 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-import sys
-from pathlib import Path
-import torch
-import torch.backends.cudnn as cudnn
+from strong_sort.utils.parser import get_config
+from strong_sort.strong_sort import StrongSORT
 
-FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # yolov5 deepsort root directory
-WEIGHTS = ROOT / 'weights'
-
-if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))  # add ROOT to PATH
-if str(ROOT / 'yolov5') not in sys.path:
-    sys.path.append(str(ROOT / 'yolov5'))  # add yolov5 ROOT to PATH
-if str(ROOT / 'deep_sort') not in sys.path:
-    sys.path.append(str(ROOT / 'deep_sort'))  # add deep_sort ROOT to PATH
-ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
-
-from yolov5.models.common import DetectMultiBackend
-from yolov5.utils.datasets import VID_FORMATS, LoadImages, LoadStreams
-from yolov5.utils.general import (LOGGER, check_img_size, non_max_suppression, scale_coords, check_requirements, cv2,
-                                  check_imshow, xyxy2xywh, increment_path, print_args, check_file)
-from yolov5.utils.torch_utils import select_device, time_sync
-from yolov5.utils.plots import Annotator, colors
-from deep_sort.utils.parser import get_config
-from deep_sort.deep_sort import DeepSort
+from typing import Optional
 
 
-@torch.no_grad()
-def run(
-        source='0',
-        yolo_weights=WEIGHTS / 'yolov5m.pt',  # model.pt path(s),
-        deep_sort_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # model.pt path,
-        config_deepsort=ROOT / 'deep_sort/configs/deep_sort.yaml',
-        imgsz=(640, 640),  # inference size (height, width)
-        conf_thres=0.25,  # confidence threshold
-        iou_thres=0.45,  # NMS IOU threshold
-        max_det=1000,  # maximum detections per image
-        device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
-        show_vid=False,  # show results
-        save_txt=False,  # save results to *.txt
-        save_conf=False,  # save confidences in --save-txt labels
-        save_crop=False,  # save cropped prediction boxes
-        save_vid=False,  # save confidences in --save-txt labels
-        nosave=False,  # do not save images/videos
-        classes=None,  # filter by class: --class 0, or --class 0 2 3
-        agnostic_nms=False,  # class-agnostic NMS
-        augment=False,  # augmented inference
-        visualize=False,  # visualize features
-        update=False,  # update all models
-        project=ROOT / 'runs/track',  # save results to project/name
-        name='exp',  # save results to project/name
-        exist_ok=False,  # existing project/name ok, do not increment
-        line_thickness=3,  # bounding box thickness (pixels)
-        hide_labels=False,  # hide labels
-        hide_conf=False,  # hide confidences
-        half=False,  # use FP16 half-precision inference
-        dnn=False,  # use OpenCV DNN for ONNX inference
-):
+class DetectionModel:
+    def __init__(
+        self,
+        model_path: str,
+        device: str,
+        confidence_threshold: float = 0.5,
+        image_size: int = 640,
+        config_path: str = 'osnet_x0_25_market1501.pt',
+        view_img: bool = True,
+        augment: bool = False,
+    ):
+        self.model_path = model_path
+        self.device = device
+        self.confidence_threshold = confidence_threshold
+        self.load_model()
+        self.prediction_list = None
+        self.image_size = image_size
+        self.config_path = config_path
+        self.view_img = view_img
+        self.augment = augment
 
-    source = str(source)
-    is_file = Path(source).suffix[1:] in (VID_FORMATS)
-    webcam = source.isnumeric() or source.endswith('.txt') or (is_file)
-    if is_file:
-        source = check_file(source)  # download
+    def load_model(self):
+        """
+        Loads the model from the path specified in the constructor.
+        """
+        raise NotImplementedError
 
-    # Directories
-    if not isinstance(yolo_weights, list):  # single yolo model
-        exp_name = str(yolo_weights).rsplit('/', 1)[-1].split('.')[0]
-    elif type(yolo_weights) is list and len(yolo_weights) == 1:  # single models after --yolo_weights
-        exp_name = yolo_weights[0].split(".")[0]
-    else:  # multiple models after --yolo_weights
-        exp_name = 'ensemble'
-    exp_name = name if name is not None else exp_name + "_" + str(deep_sort_weights).split('/')[-1].split('.')[0]
-    save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # increment run
-    (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+    def yolo_tracker(self, img):
+        """
+        Returns a list of predictions for the given image.
+        """
+        raise NotImplementedError
 
-    # Load model
-    device = select_device(device)
-    model = DetectMultiBackend(yolo_weights, device=device, dnn=dnn, data=None, fp16=half)
-    stride, names, pt = model.stride, model.names, model.pt
-    imgsz = check_img_size(imgsz, s=stride)  # check image size
+class Yolov5Sort(DetectionModel):
+    def load_model(self):
+        import yolov5
 
-    # Dataloader
-    if webcam:
-        show_vid = check_imshow()
-        cudnn.benchmark = True  # set True to speed up constant image size inference
-        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt)
-        nr_sources = len(dataset)
-    else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
-        nr_sources = 1
-    vid_path, vid_writer, txt_path = [None] * nr_sources, [None] * nr_sources, [None] * nr_sources
-
-    # initialize deepsort
-    cfg = get_config()
-    cfg.merge_from_file("deep_sort/configs/deep_sort.yaml")
-
-    # Create as many deep sort instances as there are video sources
-    deepsort_list = []
-    for i in range(nr_sources):
-        deepsort_list.append(
-            DeepSort(
-                deep_sort_weights,
-                device,
-                max_dist=cfg.DEEPSORT.MAX_DIST,
-                max_iou_distance=cfg.DEEPSORT.MAX_IOU_DISTANCE,
-                max_age=cfg.DEEPSORT.MAX_AGE, n_init=cfg.DEEPSORT.N_INIT, nn_budget=cfg.DEEPSORT.NN_BUDGET,
-            )
-        )
-    outputs = [None] * nr_sources
-
-    # Run tracking
-    model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
-    dt, seen = [0.0, 0.0, 0.0, 0.0], 0
-    for _, (path, im, im0s, vid_cap, s) in enumerate(dataset):
-        t1 = time_sync()
-        im = torch.from_numpy(im).to(device)
-        im = im.half() if half else im.float()  # uint8 to fp16/32
-        im /= 255.0  # 0 - 255 to 0.0 - 1.0
-        if len(im.shape) == 3:
-            im = im[None]  # expand for batch dim
-        t2 = time_sync()
-        dt[0] += t2 - t1
-
-        # Inference
-        visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if opt.visualize else False
-        pred = model(im, augment=opt.augment, visualize=visualize)
-        t3 = time_sync()
-        dt[1] += t3 - t2
-
-        # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms, max_det=opt.max_det)
-        dt[2] += time_sync() - t3
-
-        # Process detections
-        for i, det in enumerate(pred):  # detections per image
-            seen += 1
-            if webcam:  # nr_sources >= 1
-                p, im0, _ = path[i], im0s[i].copy(), dataset.count
-                p = Path(p)  # to Path
-                s += f'{i}: '
-                save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
-            else:
-                p, im0, _ = path, im0s.copy(), getattr(dataset, 'frame', 0)
-                p = Path(p)  # to Path
-                # video file
-                if source.endswith(VID_FORMATS):
-                    save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
-                # folder with imgs
-                else:
-                    save_path = str(save_dir / p.parent.name)  # im.jpg, vid.mp4, ...
-
-            annotator = Annotator(im0, line_width=2, pil=not ascii)
-
-            if det is not None and len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
-
-                xywhs = xyxy2xywh(det[:, 0:4])
-                confs = det[:, 4]
-                clss = det[:, 5]
-
-                # pass detections to deepsort
-                t4 = time_sync()
-                outputs[i] = deepsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
-                t5 = time_sync()
-                dt[3] += t5 - t4
-
-                # draw boxes for visualization
-                if len(outputs[i]) > 0:
-                    for j, (output, conf) in enumerate(zip(outputs[i], confs)):
+        model = yolov5.load(self.model_path, device=self.device)
+        model.conf = self.confidence_threshold
+        self.model = model
     
-                        bboxes = output[0:4]
-                        id = output[4]
-                        cls = output[5]
-                        if save_vid or save_crop or show_vid:  # Add bbox to image
-                            c = int(cls)  # integer class
-                            label = f'{id} {names[c]} {conf:.2f}'
-                            annotator.box_label(bboxes, label, color=colors(c, True))
-  
-                LOGGER.info(f'{s}Done. YOLO:({1/(t3 - t2):.3f}s), DeepSort:({1/(t5 - t4):.3f}s)')
+    def yolo_tracker(self, video_path):
+        dataset = LoadImages(video_path, self.image_size)   
+        # initialize StrongSORT
+        cfg = get_config()
+        cfg.merge_from_file('strong_sort/configs/strong_sort.yaml')
 
-            else:
-                deepsort_list[i].increment_ages()
-                LOGGER.info('No detections')
+        # Create as many strong sort instances as there are video sources
+        strongsort_list = []
+        nr_sources=1
+        for i in range(nr_sources):
+            strongsort_list.append(
+                StrongSORT(
+                    model_weights= self.config_path,
+                    device=select_device(self.device),
+                    fp16 = False,
+                    max_dist=cfg.STRONGSORT.MAX_DIST,
+                    max_iou_distance=cfg.STRONGSORT.MAX_IOU_DISTANCE,
+                    max_age=cfg.STRONGSORT.MAX_AGE,
+                    n_init=cfg.STRONGSORT.N_INIT,
+                    nn_budget=cfg.STRONGSORT.NN_BUDGET,
+                    mc_lambda=cfg.STRONGSORT.MC_LAMBDA,
+                    ema_alpha=cfg.STRONGSORT.EMA_ALPHA,
 
-            # Stream results
-            im0 = annotator.result()
-            if show_vid:
-                cv2.imshow(str(p), im0)
-                cv2.waitKey(1)  # 1 millisecond
+                )
+            )
+            strongsort_list[i].model.warmup()
+        outputs = [None] * nr_sources
+        curr_frames, prev_frames = [None] * nr_sources, [None] * nr_sources         
+        for path, im, im0s, vid_cap, s in dataset:
+            im = torch.from_numpy(im).to(self.device)
+            im = im.float()  # uint8 to fp16/32
+            im /= 255  # 0 - 255 to 0.0 - 1.0
+            if len(im.shape) == 3:
+                im = im[None]  # expand for batch dim
 
-            # Save results (image with detections)
-            if save_vid:
-                if vid_path[i] != save_path:  # new video
-                    vid_path[i] = save_path
-                    if isinstance(vid_writer[i], cv2.VideoWriter):
-                        vid_writer[i].release()  # release previous video writer
-                    if vid_cap:  # video
-                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    else:  # stream
-                        fps, w, h = 30, im0.shape[1], im0.shape[0]
-                    save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                    vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                vid_writer[i].write(im0)
+            pred = self.model(im, size=self.image_size, augment=self.augment) 
+            pred = non_max_suppression(pred, conf_thres=self.model.conf, iou_thres=self.model.iou, classes=self.model.classes, agnostic=self.model.agnostic)
 
-def parse_opt():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--yolo-weights', nargs='+', type=str, default=WEIGHTS / 'yolov5m.pt', help='model.pt path(s)')
-    parser.add_argument('--deep-sort-weights', type=str, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
-    parser.add_argument('--config-deepsort', type=str, default='deep_sort/configs/deep_sort.yaml')
-    parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')  
-    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
-    parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.45, help='NMS IoU threshold')
-    parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
-    parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
-    parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
-    parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
-    parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
-    parser.add_argument('--nosave', action='store_true', help='do not save images/videos')
-    parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
-    parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
-    parser.add_argument('--augment', action='store_true', help='augmented inference')
-    parser.add_argument('--visualize', action='store_true', help='visualize features')
-    parser.add_argument('--update', action='store_true', help='update all models')
-    parser.add_argument('--project', default=ROOT / 'runs/track', help='save results to project/name')
-    parser.add_argument('--name', help='save results to project/name')
-    parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
-    parser.add_argument('--line-thickness', default=3, type=int, help='bounding box thickness (pixels)')
-    parser.add_argument('--hide-labels', default=False, action='store_true', help='hide labels')
-    parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
-    parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
-    parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
-    opt = parser.parse_args()
-    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
-    print_args(vars(opt))
-    return opt
+            for i, det in enumerate(pred):
+                curr_frames[i] = im0s
+                annotator = Annotator(im0s, line_width=2, example=str(self.model.names))
+                if cfg.STRONGSORT.ECC:  # camera motion compensation
+                    strongsort_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
 
+                if len(det):
+                    det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0s.shape).round()
+                    xywhs = xyxy2xywh(det[:, 0:4]).cpu().detach().numpy()
+                    confs = det[:, 4].cpu().detach().numpy()
+                    clss = det[:, 5].cpu().detach().numpy()
+                    outputs[i] = strongsort_list[i].update(xywhs, confs, clss, im0s)
 
-def main(opt):
-    check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
-    run(**vars(opt))
-
-
-if __name__ == "__main__":
-    opt = parse_opt()
-    main(opt)
+                    if len(outputs[i]) > 0:
+                        for j, (output, conf) in enumerate(zip(outputs[i], confs)):
+                            bboxes = output[0:4]
+                            id = output[4]
+                            cls = output[5]
+                            
+                            if self.view_img:  # Add bbox to image
+                                c = int(cls)  # integer class
+                                id = int(id)  # integer id
+                                label = label = "%s %.2f" % (self.model.names[int(cls)], conf)
+                                annotator.box_label(bboxes, label, color=colors(c, True))
+                # Stream results
+                im0 = annotator.result()
+                if self.view_img:
+                    cv2.imshow(str(path), im0)
+                    cv2.waitKey(1)  # 1 millisecond
+                
+                prev_frames[i] = curr_frames[i]
